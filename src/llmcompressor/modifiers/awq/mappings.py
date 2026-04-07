@@ -157,13 +157,35 @@ _bloom_mappings = [
     # ),
 ]
 
-# Exaone4
+# Exaone4 (dense)
+# input_layernorm → q/k/v smoothing is skipped because ExaoneMoeAttention applies
+# per-head QK-norm (q_norm, k_norm) after the projections, making pre-projection
+# activation smoothing incorrect for the attention path.
 _exaone4_mappings = [
     AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
     AWQMapping(
         "re:.*up_proj$",
         ["re:.*down_proj$"],
     ),
+]
+
+# K-EXAONE (MoE)
+# Same QK-norm caveat as EXAONE-4.0-32B: skip input_layernorm → q/k/v smoothing.
+# post_attention_layernorm feeds both routed experts (mlp.experts.{i}.*) and
+# shared experts (mlp.shared_experts.*) — both must be listed as balance_layers
+# so AWQ scales are applied consistently across all expert paths.
+_exaone_moe_mappings = [
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        [
+            "re:.*mlp.experts.[0-9]+.gate_proj$",
+            "re:.*mlp.experts.[0-9]+.up_proj$",
+            "re:.*mlp.shared_experts.gate_proj$",
+            "re:.*mlp.shared_experts.up_proj$",
+        ],
+    ),
+    AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
 ]
 
 # AFMOE uses dual normalization: pre_mlp_layernorm feeds the MLP
@@ -222,6 +244,7 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Cohere2VisionForConditionalGeneration": _cohere_mappings,
     "DeepseekV3ForCausalLM": _deepseek_mappings,
     "Exaone4ForCausalLM": _exaone4_mappings,
+    "ExaoneMoeForCausalLM": _exaone_moe_mappings,
     "Gemma2ForCausalLM": _gemma_mappings,
     "Gemma3ForCausalLM": _gemma_mappings,
     "Gemma3ForConditionalGeneration": _gemma_mappings,
