@@ -7,9 +7,9 @@ from llmcompressor.modifiers.awq import AWQModifier
 
 # Select model.
 # K-EXAONE-236B-A23B is a Mixture-of-Experts model with 128 routed experts
-# and 2 shared experts per layer.
+# and 1 shared expert per MoE layer (config: num_shared_experts=1).
 #
-# Note: requires transformers >= 5.1.0 (exaone_moe model type was added in 5.1)
+# Note: requires transformers >= 5.1.0 (exaone_moe model type was added in 5.
 
 model_id = "LGAI-EXAONE/K-EXAONE-236B-A23B"
 
@@ -69,19 +69,33 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
+# Derive dense-layer indices from config so the ignore list stays correct
+# across ExaoneMoe variants (e.g. models with more than one dense prefix layer).
+# config.mlp_layer_types is a per-layer list: "dense" | "sparse".
+# config.first_k_dense_replace is an integer alternative; mlp_layer_types is
+# more explicit and preferred.
+dense_mlp_ignores = [
+    f"model.layers.{i}.mlp.*"
+    for i, layer_type in enumerate(model.config.mlp_layer_types)
+    if layer_type == "dense"
+]
+
+# Note on MTP (multi-token prediction) layers:
+# K-EXAONE includes num_nextn_predict_layers=1 MTP weights in its checkpoint,
+# but AutoModelForCausalLM excludes them via _keys_to_ignore_on_load_unexpected.
+# They are therefore not present as model submodules and require no explicit
+# ignore entry here. If you load a model that does include MTP modules, add
+# "re:.*nextn.*" to the ignore list below.
+
 # Configure the quantization algorithm to run.
 # Ignore list:
-#   lm_head           — output projection, kept at full precision
-#   re:.*gate.weight  — MoE router weights (sigmoid-gated, sensitive to quant)
-#   re:.*\.0\.mlp\..* — layer 0 is a dense ExaoneMoeMLP, not a MoE block
+#   lm_head          — output projection, kept at full precision
+#   re:.*gate.weight — MoE router weights (sigmoid-gated, sensitive to quant)
+#   dense_mlp_ignores — dense MLP layers derived from config.mlp_layer_types
 recipe = AWQModifier(
     targets="Linear",
     scheme="W4A16",
-    ignore=[
-        "lm_head",
-        "re:.*gate.weight",
-        "re:.*\\.0\\.mlp\\..*",
-    ],
+    ignore=["lm_head", "re:.*gate.weight", *dense_mlp_ignores],
 )
 
 # Apply algorithms.
