@@ -13,7 +13,7 @@ from llmcompressor.modifiers.awq import AWQModifier
 
 model_id = "LGAI-EXAONE/K-EXAONE-236B-A23B"
 
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="cpu")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 # MoE calibration is now handled automatically by the pipeline.
@@ -36,7 +36,7 @@ DATASET_SPLIT = "train_sft"
 
 # Select number of samples. 512 samples is a good place to start.
 # Increasing the number of samples can improve accuracy.
-NUM_CALIBRATION_SAMPLES = 512
+NUM_CALIBRATION_SAMPLES = 128
 MAX_SEQUENCE_LENGTH = 2048
 
 # Load dataset and preprocess.

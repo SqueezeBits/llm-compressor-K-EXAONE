@@ -74,6 +74,16 @@ Please refer to [compression_schemes.md](./docs/guides/compression_schemes.md) f
 pip install llmcompressor
 ```
 
+## Settings for K-EXAONE
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+uv pip install "transformers>=5.1.0"
+```
+
 ## Get Started
 
 ### End-to-End Examples
