@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.modeling.k_exaone_moe import CalibrationExaoneMoeSparseMoEBlock  # noqa: F401
 from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.awq.mappings import AWQMapping
 
 # Select model.
 # K-EXAONE-236B-A23B is a Mixture-of-Experts model with 128 routed experts
@@ -34,10 +35,15 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
 
-# Select number of samples. 512 samples is a good place to start.
-# Increasing the number of samples can improve accuracy.
-NUM_CALIBRATION_SAMPLES = 128
-MAX_SEQUENCE_LENGTH = 2048
+# For K-EXAONE-236B MoE: AWQ accumulates raw input activations for every
+# hooked nn.Linear (256 modules per sparse layer: 128 experts × gate+up).
+# Storage per module ≈ N_samples × seq_len × 6144 × 2 bytes.
+# With device_map="cpu" the model already occupies ~472 GB RAM, leaving
+# ~40 GB for activations. Budget:
+#   32 samples × 512 tokens × 6144 × 2B × 256 modules ≈ 50 GB — fits.
+#   128 samples × 2048 tokens × same                  ≈ 820 GB — OOM.
+NUM_CALIBRATION_SAMPLES = 32
+MAX_SEQUENCE_LENGTH = 512
 
 # Load dataset and preprocess.
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
@@ -87,6 +93,35 @@ dense_mlp_ignores = [
 # ignore entry here. If you load a model that does include MTP modules, add
 # "re:.*nextn.*" to the ignore list below.
 
+# Build per-sparse-layer post_attention_layernorm → expert mappings.
+#
+# WHY not use the auto-inferred _exaone_moe_mappings regex?
+# K-EXAONE layer 0 is dense: it has post_attention_layernorm but no
+# mlp.experts.* or mlp.shared_experts.*. match_modules_set groups by
+# lowest-common-ancestor context; because layer 0 never satisfies the
+# expert balance targets, parent_context rises to "model.layers" and
+# never resets — all 48 post_attention_layernorm modules end up in one
+# set, triggering "AWQ needs to match a single smoothlayer" ValueError.
+#
+# Explicit per-layer exact-name smooth targets keep each set to exactly
+# one post_attention_layernorm. Dense layer 0 is omitted entirely (its
+# MLP is already excluded from quantization via dense_mlp_ignores).
+sparse_layer_indices = [
+    i for i, lt in enumerate(model.config.mlp_layer_types) if lt == "sparse"
+]
+moe_smooth_mappings = [
+    AWQMapping(
+        f"model.layers.{i}.post_attention_layernorm",
+        [
+            f"re:model\\.layers\\.{i}\\.mlp\\.experts\\.[0-9]+\\.gate_proj$",
+            f"re:model\\.layers\\.{i}\\.mlp\\.experts\\.[0-9]+\\.up_proj$",
+            f"model.layers.{i}.mlp.shared_experts.gate_proj",
+            f"model.layers.{i}.mlp.shared_experts.up_proj",
+        ],
+    )
+    for i in sparse_layer_indices
+]
+
 # Configure the quantization algorithm to run.
 # Ignore list:
 #   lm_head          — output projection, kept at full precision
@@ -96,6 +131,15 @@ recipe = AWQModifier(
     targets="Linear",
     scheme="W4A16",
     ignore=["lm_head", "re:.*gate.weight", *dense_mlp_ignores],
+    mappings=[
+        # v_proj → o_proj: skipped at runtime due to GQA shape incompatibility
+        # (o_proj input dim 8192 ≠ v_proj output dim 1024), but kept here so
+        # smoothing is applied on models where it does match.
+        AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+        # MoE layers: one mapping per sparse layer (avoids regex grouping bug)
+        *moe_smooth_mappings,
+        AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
+    ],
 )
 
 # Apply algorithms.
