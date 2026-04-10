@@ -22,7 +22,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
 
-NUM_CALIBRATION_SAMPLES = 32
+NUM_CALIBRATION_SAMPLES = 512
 MAX_SEQUENCE_LENGTH = 512
 
 # Load dataset and preprocess.
@@ -93,6 +93,7 @@ recipe = AWQModifier(
         *moe_smooth_mappings,
         AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
     ],
+    cache_chunk_size_batches=32,
 )
 
 # Apply algorithms

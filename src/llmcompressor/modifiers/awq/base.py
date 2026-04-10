@@ -162,6 +162,24 @@ class AWQModifier(Modifier, QuantizationMixin):
     offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
     n_grid: int = 20
+    cache_chunk_size_batches: int | None = None
+    """
+    When set to an integer K, AWQ smoothing is performed in chunks of K
+    calibration batches rather than buffering all parent-module kwargs at once.
+
+    - ``None`` (default): preserve the current behaviour where every parent-arg
+      batch is cached in ``_parent_args_cache`` and replayed in full during
+      ``_apply_smoothing``.
+    - ``K > 0``: peak AWQ RAM for the parent-args cache scales with K instead of
+      the total number of calibration batches.  This trades extra compute (one
+      extra subgraph forward pass per batch during the smoothing stage) for
+      significantly lower peak CPU RAM, which is critical for large MoE models
+      such as K-EXAONE-236B-A23B.
+
+    Only takes effect in the sequential pipeline (``SEQUENTIAL_EPOCH_END``).
+    The basic pipeline path (``CALIBRATION_EPOCH_END``) always uses the
+    non-chunked path regardless of this setting.
+    """
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
@@ -263,7 +281,11 @@ class AWQModifier(Modifier, QuantizationMixin):
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
             # Run smoothing in case of sequential pipeline
             QuantizationMixin.sync_activation_observers(self, state.model)
-            self._apply_smoothing(state.model)
+            activations = getattr(state, "current_activations", None)
+            if self.cache_chunk_size_batches is not None and activations is not None:
+                self._apply_smoothing_chunked(state.model, state)
+            else:
+                self._apply_smoothing(state.model)
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             # Run smoothing in case of basic pipeline
@@ -475,6 +497,10 @@ class AWQModifier(Modifier, QuantizationMixin):
 
             return cache_smooth_activations_hook
 
+        # In chunked mode we do not accumulate parent kwargs during calibration;
+        # they are captured on-the-fly in _apply_smoothing_chunked instead.
+        use_chunked = self.cache_chunk_size_batches is not None
+
         for mapping in self._resolved_mappings:
             # parent kwargs needed for future forward passes
             # same parent may appear multiple times in resolved mappings
@@ -483,12 +509,15 @@ class AWQModifier(Modifier, QuantizationMixin):
                     None,
                     self.offload_device,
                 )
-                self.register_hook(
-                    mapping.parent,
-                    cache_parent_kwargs_hook,
-                    "forward_pre",
-                    with_kwargs=True,
-                )
+                if not use_chunked:
+                    # Chunked mode: skip this hook — parent args are captured
+                    # lazily in _apply_smoothing_chunked to bound peak RAM.
+                    self.register_hook(
+                        mapping.parent,
+                        cache_parent_kwargs_hook,
+                        "forward_pre",
+                        with_kwargs=True,
+                    )
 
             # input activations to balance layers needed for loss function
             # storing inputs to first balance layer is sufficient
@@ -612,6 +641,453 @@ class AWQModifier(Modifier, QuantizationMixin):
         for v in self._parent_args_cache.values():
             v.batch_intermediates.clear()
         self._assert_all_activations_consumed()
+
+    @torch.no_grad()
+    def _apply_smoothing_chunked(self, model: Module, state) -> None:
+        """
+        Chunked variant of ``_apply_smoothing`` that bounds peak CPU RAM.
+
+        **Key performance fix**: uses a *chunk-outer / mapping-inner* loop so
+        that a single ``subgraph.forward()`` call per calibration batch serves
+        ALL mappings simultaneously.  The previous mapping-outer design called
+        ``subgraph.forward()`` once per batch *per mapping*, which for K-EXAONE
+        (~130 mappings × 512 batches) caused ~65× overhead.
+
+        Algorithm:
+        1. Pre-compute per-mapping state (x_mean, w_mean, candidates, …).
+        2. Register one forward/pre hook per *unique* parent module (deduplicated).
+        3. For each chunk of K batches:
+           a. Restore ALL balance-layer weights to their originals.
+           b. Run ``subgraph.forward()`` **once per batch** with all parent hooks
+              live, capturing fp16 outputs and input kwargs for every parent.
+           c. Remove the capture hooks.
+           d. For each mapping, run the grid search using the pre-captured data
+              (cheap ``parent(**kw)`` calls, not full subgraph forwards).
+           e. Restore each mapping's balance layers after its own grid search so
+              the next mapping sees clean weights for any shared parent.
+        4. After all chunks, pick the best candidate and apply smoothing for
+           every mapping.
+
+        :param model: model being calibrated
+        :param state: current session state (must have ``current_activations``
+            and ``current_subgraph`` populated by the sequential pipeline)
+        """
+        activations = state.current_activations  # IntermediatesCache
+        subgraph = state.current_subgraph
+        num_batches = len(activations)
+        chunk_size = self.cache_chunk_size_batches
+
+        mappings_to_smooth = [
+            mapping
+            for mapping in self._resolved_mappings
+            if mapping.smooth_name in self._smooth_activation_stats
+        ]
+        if not mappings_to_smooth:
+            self._assert_all_activations_consumed()
+            return
+
+        # ── Step 1: pre-compute per-mapping state ────────────────────────────────
+        match self.duo_scaling:
+            case "both":
+                _n_grid = int(self.n_grid / 2)
+                _duo_scalings = [False, True]
+            case _:
+                _n_grid = self.n_grid
+                _duo_scalings = [self.duo_scaling]
+        _candidates = list(product(range(_n_grid), _duo_scalings))
+
+        per_states: list[dict] = []
+        all_smooth_layers: list[Module] = []
+        all_balance_layers: list[Module] = []
+        all_bls_to_patch: list[Module] = []
+        all_observers: list = []
+
+        for mapping in mappings_to_smooth:
+            device = get_execution_device(mapping.parent)
+            x_sum, count = self._smooth_activation_stats[mapping.smooth_name]
+            if is_distributed():
+                x_sum, count = _allreduce_data_sum([x_sum, count])
+            x_mean = x_sum.to(device) / count.to(device)
+
+            w_mean = None
+            if self.duo_scaling:
+                w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+
+            orig_weights = {bl: bl.weight.clone() for bl in mapping.balance_layers}
+
+            bls_to_patch = [
+                bl
+                for bl in mapping.balance_layers
+                if hasattr(bl, "quantization_scheme")
+                and hasattr(bl.quantization_scheme, "weights")
+            ]
+            observers = [
+                Observer.load_from_registry(
+                    "memoryless_minmax",
+                    base_name="weight",
+                    args=bl.quantization_scheme.weights,
+                    module=bl,
+                )
+                for bl in bls_to_patch
+            ]
+
+            per_states.append(
+                {
+                    "device": device,
+                    "x_mean": x_mean,
+                    "w_mean": w_mean,
+                    "orig_weights": orig_weights,
+                    "bls_to_patch": bls_to_patch,
+                    "global_loss_sums": [0.0] * len(_candidates),
+                    "global_num_elements": [0] * len(_candidates),
+                    "found_valid": False,
+                }
+            )
+
+            all_smooth_layers.append(mapping.smooth_layer)
+            all_balance_layers.extend(mapping.balance_layers)
+            all_bls_to_patch.extend(bls_to_patch)
+            all_observers.extend(observers)
+
+        # Collect unique parent modules (ordered, deduplicated by identity)
+        unique_parents: list[Module] = list(
+            {id(m.parent): m.parent for m in mappings_to_smooth}.values()
+        )
+
+        with (
+            align_modules(unique_parents + all_smooth_layers + all_balance_layers),
+            calibration_forward_context(model),
+            HooksMixin.disable_hooks(),
+            patch_attrs(all_bls_to_patch, "weight_observer", all_observers),
+        ):
+            # ── Step 2-3: chunk loop ──────────────────────────────────────────────
+            for chunk_start in tqdm(
+                range(0, num_batches, chunk_size), desc="Smoothing (chunked)"
+            ):
+                chunk_end = min(chunk_start + chunk_size, num_batches)
+
+                # 3a. Restore ALL balance layers to original weights
+                for pstate in per_states:
+                    for bl, orig_w in pstate["orig_weights"].items():
+                        bl.weight.data.copy_(orig_w.to(bl.weight.device))
+
+                # 3b. Register capture hooks for ALL unique parents simultaneously
+                # Maps parent identity → list of captured kwargs / fp16 outputs
+                chunk_fp16: dict[int, list[torch.Tensor]] = {
+                    id(p): [] for p in unique_parents
+                }
+                chunk_kwargs: dict[int, list[dict]] = {
+                    id(p): [] for p in unique_parents
+                }
+
+                def _make_pre_hook(pid: int):
+                    def _pre(module, args, kwargs):
+                        vals = inspect.signature(module.forward).bind(*args, **kwargs)
+                        chunk_kwargs[pid].append(dict(vals.arguments))
+
+                    return _pre
+
+                def _make_fwd_hook(pid: int):
+                    def _fwd(module, args, output):
+                        out = output[0] if isinstance(output, tuple) else output
+                        chunk_fp16[pid].append(out.detach())
+
+                    return _fwd
+
+                handles = []
+                for parent in unique_parents:
+                    pid = id(parent)
+                    handles.append(
+                        parent.register_forward_pre_hook(
+                            _make_pre_hook(pid), with_kwargs=True, prepend=True
+                        )
+                    )
+                    handles.append(
+                        parent.register_forward_hook(
+                            _make_fwd_hook(pid), prepend=True
+                        )
+                    )
+
+                try:
+                    for batch_idx in range(chunk_start, chunk_end):
+                        inputs = activations.fetch(
+                            batch_idx, list(subgraph.input_names)
+                        )
+                        state.current_batch_idx = batch_idx
+                        subgraph.forward(model, **inputs)
+                finally:
+                    for h in handles:
+                        h.remove()
+
+                # 3c-e. Per-mapping grid search on pre-captured chunk data
+                for mapping, pstate in zip(mappings_to_smooth, per_states):
+                    pid = id(mapping.parent)
+                    cfp16 = chunk_fp16[pid]
+                    ckw = chunk_kwargs[pid]
+
+                    # Skip if this parent produced no outputs this chunk
+                    if not cfp16 or all(f.numel() == 0 for f in cfp16):
+                        logger.debug(
+                            f"AWQ chunked: chunk [{chunk_start}:{chunk_end}] for "
+                            f"{mapping.smooth_name} has no outputs, skipping."
+                        )
+                        continue
+                    if not all(f.isfinite().all() for f in cfp16):
+                        logger.warning(
+                            f"AWQ chunked: chunk [{chunk_start}:{chunk_end}] for "
+                            f"{mapping.smooth_name} has NaN/inf fp16 outputs, "
+                            "skipping chunk."
+                        )
+                        continue
+
+                    pstate["found_valid"] = True
+                    device = pstate["device"]
+                    x_mean = pstate["x_mean"]
+                    w_mean = pstate["w_mean"]
+                    orig_weights = pstate["orig_weights"]
+                    bls_to_patch = pstate["bls_to_patch"]
+
+                    for cand_idx, (grid_idx, use_duo_scaling) in enumerate(
+                        _candidates
+                    ):
+                        ratio = grid_idx / _n_grid
+                        if use_duo_scaling and w_mean is not None:
+                            scales = (
+                                x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)
+                            ).clamp(min=1e-4)
+                        else:
+                            scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+                        scales = scales / (scales.max() * scales.min()).sqrt()
+                        scales[torch.isinf(scales)] = 1
+                        scales[torch.isnan(scales)] = 1
+                        _sv = scales.view(1, -1).to(device)
+
+                        # Q(W * s) for this mapping's balance layers only
+                        for bl in bls_to_patch:
+                            w_qscheme = bl.quantization_scheme.weights
+                            bl.weight.data.copy_(
+                                orig_weights[bl].to(_sv.device) * _sv
+                            )
+                            should_calc_gparam = (
+                                w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                            )
+                            call_observer(
+                                bl,
+                                "weight",
+                                bl.weight,
+                                should_calculate_gparam=should_calc_gparam,
+                            )
+                            bl.weight.data = (
+                                forward_quantize(bl, bl.weight, "weight", w_qscheme)
+                                / _sv
+                            ).to(bl.weight.dtype)
+
+                        if bls_to_patch and all(
+                            getattr(bl.quantization_scheme.weights, "strategy", None)
+                            == QuantizationStrategy.TENSOR_GROUP
+                            for bl in bls_to_patch
+                        ):
+                            update_fused_layer_weight_global_scales(mapping.parent)
+
+                        # Cheap parent-only forward (not full subgraph)
+                        int_w_chunk = [
+                            (lambda o: o[0] if isinstance(o, tuple) else o)(
+                                mapping.parent(**kw)
+                            )
+                            for kw in ckw
+                        ]
+
+                        loss_sum, n_elem = self._compute_chunk_loss_sum(
+                            cfp16, int_w_chunk, chunk_start
+                        )
+                        pstate["global_loss_sums"][cand_idx] += loss_sum
+                        pstate["global_num_elements"][cand_idx] += n_elem
+                        del int_w_chunk
+
+                    # Restore this mapping's balance layers so next mapping's
+                    # parent(**kw) sees clean weights for any shared parent
+                    for bl in bls_to_patch:
+                        bl.weight.data.copy_(orig_weights[bl].to(bl.weight.device))
+
+                del chunk_fp16, chunk_kwargs
+
+            # ── Step 4: finalise each mapping ─────────────────────────────────────
+            for mapping, pstate in zip(mappings_to_smooth, per_states):
+                smooth_layer = mapping.smooth_layer
+                balance_layers = mapping.balance_layers
+                device = pstate["device"]
+                x_mean = pstate["x_mean"]
+                w_mean = pstate["w_mean"]
+                orig_weights = pstate["orig_weights"]
+                bls_to_patch = pstate["bls_to_patch"]
+                global_loss_sums = pstate["global_loss_sums"]
+                global_num_elements = pstate["global_num_elements"]
+
+                if not pstate["found_valid"]:
+                    logger.info(
+                        f"Skipping smooth_layer {mapping.smooth_name}, no activations "
+                        "found to scale. This can occasionally occur in MoE models "
+                        "when certain experts are not activated by calibration samples."
+                    )
+                    del self._smooth_activation_stats[mapping.smooth_name]
+                    del pstate["orig_weights"]
+                    continue
+
+                # Restore weights before final smoothing application
+                for bl in bls_to_patch:
+                    bl.weight.data.copy_(orig_weights[bl].to(bl.weight.device))
+
+                # Distributed allreduce of accumulated losses
+                if is_distributed():
+                    for i in range(len(_candidates)):
+                        ls_t = torch.tensor(
+                            global_loss_sums[i], dtype=torch.float32
+                        )
+                        ne_t = torch.tensor(
+                            float(global_num_elements[i]), dtype=torch.float32
+                        )
+                        ls_t, ne_t = _allreduce_data_sum([ls_t, ne_t])
+                        global_loss_sums[i] = ls_t.item()
+                        global_num_elements[i] = ne_t.item()
+
+                # Pick best candidate
+                losses = [
+                    ls / max(ne, 1)
+                    for ls, ne in zip(global_loss_sums, global_num_elements)
+                ]
+                best_cand_idx = min(range(len(losses)), key=lambda i: losses[i])
+                if not torch.isfinite(torch.tensor(losses[best_cand_idx])):
+                    raise RuntimeError(
+                        f"No finite loss found in chunked AWQ grid search for "
+                        f"{mapping.smooth_name}. This typically indicates NaN values "
+                        "in the parent-module forward pass."
+                    )
+
+                best_grid_idx, best_duo = _candidates[best_cand_idx]
+                best_ratio = best_grid_idx / _n_grid
+
+                if best_duo and w_mean is not None:
+                    best_scales = (
+                        x_mean.pow(best_ratio) / (w_mean.pow(1 - best_ratio) + 1e-4)
+                    ).clamp(min=1e-4)
+                else:
+                    best_scales = x_mean.pow(best_ratio).clamp(min=1e-4).view(-1)
+                best_scales = (
+                    best_scales / (best_scales.max() * best_scales.min()).sqrt()
+                )
+                best_scales[torch.isinf(best_scales)] = 1
+                best_scales[torch.isnan(best_scales)] = 1
+
+                assert (
+                    torch.isnan(best_scales).sum() == 0
+                ), f"NaN found in chunked best scales: {best_scales}"
+
+                # Error metrics
+                initial_error = losses[0]
+                best_error = losses[best_cand_idx]
+                err_reduction = (
+                    best_error / initial_error if initial_error > 0 else 1.0
+                )
+                logger.debug(
+                    f"AWQ chunked grid search for {mapping.smooth_name}: "
+                    f"initial error = {initial_error:.3e}, "
+                    f"best error = {best_error:.3e}, "
+                    f"error reduction rate (best/initial) = {err_reduction * 100:.3f}%"
+                )
+                self._error_metrics.append(
+                    {
+                        "layer_name": mapping.smooth_name,
+                        "parent_name": mapping.parent_name,
+                        "initial_error": initial_error,
+                        "best_error": best_error,
+                        "reduction": err_reduction,
+                    }
+                )
+
+                # Apply smoothing (identical to non-chunked path)
+                @torch.no_grad()
+                def _smooth(module: Module, _orig: dict, _scales: torch.Tensor):
+                    s = _scales.to(module.weight.device)
+                    if module in balance_layers:
+                        update_offload_parameter(
+                            module,
+                            "weight",
+                            _orig[module].to(module.weight.device) * s.view(1, -1),
+                        )
+                    elif module == smooth_layer:
+                        if module.weight.ndim == 1:
+                            update_offload_parameter(
+                                module, "weight", module.weight.div_(s)
+                            )
+                        else:
+                            weight = module.weight
+                            weight[-s.size(0) :].div_(s.view(-1, 1))
+                            update_offload_parameter(module, "weight", weight)
+                        if hasattr(module, "bias") and module.bias is not None:
+                            update_offload_parameter(
+                                module, "bias", module.bias.div_(s)
+                            )
+
+                for layer in balance_layers:
+                    _smooth(layer, orig_weights, best_scales)
+                _smooth(smooth_layer, orig_weights, best_scales)
+
+                del self._smooth_activation_stats[mapping.smooth_name]
+                del pstate["orig_weights"]
+
+        self._assert_all_activations_consumed()
+
+    @torch.no_grad()
+    def _compute_chunk_loss_sum(
+        self,
+        fp16_outputs: list[torch.Tensor],
+        int_w_outputs: list[torch.Tensor],
+        chunk_start_idx: int,
+    ) -> tuple[float, int]:
+        """
+        Compute the unnormalised MSE loss sum and element count for a single
+        chunk of batches.  Callers accumulate these across chunks and divide
+        at the end to obtain the normalised per-candidate loss.
+
+        Unlike :meth:`_compute_loss`, this method does **not** call allreduce
+        (distributed aggregation is deferred to after all chunks are summed).
+
+        :param fp16_outputs: fp16 parent-module outputs for the chunk
+        :param int_w_outputs: pseudo-quantised parent-module outputs for the chunk
+        :param chunk_start_idx: global batch index of the first batch in the chunk
+            (used to look up the correct loss mask)
+        :return: ``(loss_sum, num_elements)`` — both unnormalised scalars
+        """
+        import torch.nn.functional as F
+
+        session = active_session()
+        loss_masks = session.state.loss_masks if session.state else None
+
+        device = fp16_outputs[0].device
+        loss = torch.tensor(0.0, device=device)
+        num_elements = torch.tensor(0, device=device)
+
+        for batch_offset, (fp16_batch, int_w_batch) in enumerate(
+            zip(fp16_outputs, int_w_outputs)
+        ):
+            batch_idx = chunk_start_idx + batch_offset
+            loss_mask = loss_masks[batch_idx] if loss_masks else None
+
+            if loss_mask is not None:
+                token_mask = loss_mask.to(fp16_batch.device) == 1
+                fp16_masked = fp16_batch[token_mask]
+                int_w_masked = int_w_batch.to(fp16_batch.device)[token_mask]
+                loss += F.mse_loss(fp16_masked, int_w_masked, reduction="sum")
+                num_elements += fp16_masked.numel()
+            else:
+                loss += F.mse_loss(
+                    fp16_batch,
+                    int_w_batch.to(fp16_batch.device),
+                    reduction="sum",
+                )
+                num_elements += fp16_batch.numel()
+
+        return loss.item(), int(num_elements.item())
 
     @torch.no_grad()
     def _run_samples(self, module: Module) -> list[torch.Tensor]:
