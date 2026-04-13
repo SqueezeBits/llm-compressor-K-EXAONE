@@ -105,6 +105,8 @@ oneshot(
     sequential_targets=["ExaoneMoeDecoderLayer"],
 )
 
+model.config.architectures = ["ExaoneMoEForCausalLM"]
+
 # Save to disk compressed.
 SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W4A16-G128"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
