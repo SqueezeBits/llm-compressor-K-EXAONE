@@ -153,6 +153,12 @@ class SequentialPipeline(CalibrationPipeline):
                         session.state.current_batch_idx = batch_idx
                         subgraph.forward(model, **inputs)
 
+                    # Expose activations cache and subgraph so that modifiers
+                    # (e.g. AWQ chunked smoothing) can replay data in chunks
+                    # without holding the full parent-args cache in RAM.
+                    session.state.current_activations = activations
+                    session.state.current_subgraph = subgraph
+
                     LifecycleCallbacks.sequential_epoch_end(subgraph)
 
                     # this pass does not trigger modifier hooks
