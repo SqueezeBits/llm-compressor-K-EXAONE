@@ -87,9 +87,7 @@ recipe = AWQModifier(
     scheme="W4A16",
     ignore=["lm_head", "re:.*gate.weight", *dense_mlp_ignores],
     mappings=[
-        # v_proj → o_proj: skipped at runtime due to GQA shape incompatibility
-        AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
-        # MoE layers: one mapping per sparse layer (avoids regex grouping bug)
+        # MoE layers: one mapping per sparse layer (avoids cross-layer LCA bug)
         *moe_smooth_mappings,
         AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
     ],
