@@ -76,12 +76,20 @@ pip install llmcompressor
 
 ## Settings for K-EXAONE
 
+### Install
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv
+uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e .
 uv pip install "transformers>=5.1.0"
+```
+
+### AWQ training
+
+```bash
+python ./examples/quantizing_moe/k_exaone_example.py
 ```
 
 ## Get Started
