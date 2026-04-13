@@ -174,8 +174,11 @@ _exaone4_mappings = [
 # post_attention_layernorm feeds both routed experts (mlp.experts.{i}.*) and
 # shared experts (mlp.shared_experts.*) — both must be listed as balance_layers
 # so AWQ scales are applied consistently across all expert paths.
+# Note: v_proj → o_proj mapping is omitted because K-EXAONE uses GQA, so
+# v_proj.out_features (num_kv_heads * head_dim) != o_proj.in_features
+# (num_heads * head_dim). The shape check in _check_layers_are_compatible
+# would reject it for every layer anyway, generating spurious warnings.
 _exaone_moe_mappings = [
-    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
     AWQMapping(
         "re:.*post_attention_layernorm$",
         [

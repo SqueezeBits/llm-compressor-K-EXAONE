@@ -819,6 +819,9 @@ class AWQModifier(Modifier, QuantizationMixin):
                     for h in handles:
                         h.remove()
 
+                # Release fragmented GPU allocations from the subgraph forwards
+                torch.cuda.empty_cache()
+
                 # 3c-e. Per-mapping grid search on pre-captured chunk data
                 for mapping, pstate in zip(mappings_to_smooth, per_states):
                     pid = id(mapping.parent)
