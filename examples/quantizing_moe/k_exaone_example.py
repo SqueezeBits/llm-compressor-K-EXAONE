@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
@@ -19,27 +19,78 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # MoE calibration is now handled automatically by the pipeline.
 
 # Select calibration dataset.
-DATASET_ID = "HuggingFaceH4/ultrachat_200k"
-DATASET_SPLIT = "train_sft"
-
 NUM_CALIBRATION_SAMPLES = 512
-MAX_SEQUENCE_LENGTH = 512
+MAX_SEQUENCE_LENGTH = 2048
 
-# Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
-
-
-def preprocess(example):
-    return {
-        "text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-        )
-    }
+N_KOALPACA = 512
+N_ULTRACHAT_KO = 0
+N_ULTRACHAT_EN = 0
 
 
-ds = ds.map(preprocess)
+def make_koalpaca(n):
+    ds = load_dataset("beomi/KoAlpaca-RealQA", split="train")
+    ds = ds.shuffle(seed=42).select(range(n))
+
+    def preprocess(example):
+        messages = [
+            {"role": "user", "content": example["question"]},
+            {"role": "assistant", "content": example["answer"]},
+        ]
+        return {
+            "text": tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        }
+
+    return ds.map(preprocess).select_columns(["text"])
+
+
+def make_ultrachat_ko(n):
+    ds = load_dataset("ChuGyouk/HFH4_ultrachat_200k_ko", split=f"train_sft[:{n}]")
+    ds = ds.shuffle(seed=43)
+
+    def preprocess(example):
+        return {
+            "text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        }
+
+    return ds.map(preprocess).select_columns(["text"])
+
+
+def make_ultrachat_en(n):
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=f"train_sft[:{n}]")
+    ds = ds.shuffle(seed=44)
+
+    def preprocess(example):
+        return {
+            "text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        }
+
+    return ds.map(preprocess).select_columns(["text"])
+
+
+dataset_parts = []
+
+if N_KOALPACA > 0:
+    dataset_parts.append(make_koalpaca(N_KOALPACA))
+
+if N_ULTRACHAT_KO > 0:
+    dataset_parts.append(make_ultrachat_ko(N_ULTRACHAT_KO))
+
+if N_ULTRACHAT_EN > 0:
+    dataset_parts.append(make_ultrachat_en(N_ULTRACHAT_EN))
+
+ds = concatenate_datasets(dataset_parts).shuffle(seed=42)
 
 
 # Tokenize inputs.
@@ -91,7 +142,7 @@ recipe = AWQModifier(
         *moe_smooth_mappings,
         AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
     ],
-    cache_chunk_size_batches=32,
+    cache_chunk_size_batches=16,
 )
 
 # Apply algorithms
